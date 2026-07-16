@@ -253,7 +253,10 @@ function GameScreen({ room, localId, sendInput, onRestart, onLeave }: GameProps)
 }
 
 export default function App() {
-  const socket: Socket = useMemo(() => io({ transports: ['websocket', 'polling'] }), [])
+  const socket: Socket = useMemo(
+    () => io(import.meta.env.VITE_SERVER_URL || undefined, { transports: ['websocket', 'polling'] }),
+    [],
+  )
   const [connected, setConnected] = useState(socket.connected)
   const [room, setRoom] = useState<RoomState | null>(null)
   const [error, setError] = useState('')

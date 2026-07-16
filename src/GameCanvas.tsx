@@ -7,6 +7,13 @@ const VIEW_H = 720
 const PLAYER_W = 34
 const PLAYER_H = 50
 const COLORS = ['#f6c945', '#54c9bd']
+const SERVER_TICK_MS = 1000 / 60
+const INTERPOLATION_DELAY_MS = 50
+const MAX_EXTRAPOLATION_MS = 100
+const LOCAL_MOVE_SPEED = 6.2
+const LOCAL_JUMP_SPEED = 14.2
+const LOCAL_GRAVITY = 0.72
+const LOCAL_CORRECTION_MS = 140
 
 const PLATFORMS = [
   { x: 0, y: 620, w: 760, h: 100 },
@@ -28,6 +35,7 @@ const SPIKES = [
 const CHECKPOINTS = [1180, 2780, 4280]
 const PLATES = [1510, 1775]
 const NODES = [3080, 3280]
+const BRIDGE = { x: 2210, y: 570, w: 510, h: 22 }
 
 function worldX(x: number, camera: number) {
   return Math.round(x - camera)
@@ -221,6 +229,97 @@ function renderGame(ctx: CanvasRenderingContext2D, game: GameState, camera: numb
   game.players.forEach((player) => drawPlayer(ctx, player, camera))
 }
 
+type TimedSnapshot = {
+  game: GameState
+  receivedAt: number
+}
+
+type LocalVisualState = {
+  id: string
+  x: number
+  y: number
+  lastFrameAt: number
+}
+
+function lerp(from: number, to: number, progress: number) {
+  return from + (to - from) * progress
+}
+
+function projectPlayer(player: PlayerState, milliseconds: number, worldWidth: number) {
+  if (player.downed || milliseconds <= 0) return player
+  const ticks = milliseconds / SERVER_TICK_MS
+  return {
+    ...player,
+    x: Math.max(0, Math.min(worldWidth - PLAYER_W, player.x + player.vx * ticks)),
+    y: player.grounded
+      ? player.y
+      : player.y + player.vy * ticks + LOCAL_GRAVITY * ticks * ticks * 0.5,
+  }
+}
+
+function sampleBufferedGame(snapshots: TimedSnapshot[], renderAt: number) {
+  const first = snapshots[0]
+  const latest = snapshots[snapshots.length - 1]
+  if (!first || !latest) return null
+  if (snapshots.length === 1 || renderAt <= first.receivedAt) return first.game
+
+  for (let index = 1; index < snapshots.length; index += 1) {
+    const after = snapshots[index]
+    if (after.receivedAt < renderAt) continue
+    const before = snapshots[index - 1]
+    const duration = Math.max(1, after.receivedAt - before.receivedAt)
+    const progress = Math.max(0, Math.min(1, (renderAt - before.receivedAt) / duration))
+    const beforePlayers = new Map(before.game.players.map((player) => [player.id, player]))
+    return {
+      ...after.game,
+      elapsedMs: Math.round(lerp(before.game.elapsedMs, after.game.elapsedMs, progress)),
+      players: after.game.players.map((player) => {
+        const previous = beforePlayers.get(player.id)
+        if (!previous) return player
+        return {
+          ...player,
+          x: lerp(previous.x, player.x, progress),
+          y: lerp(previous.y, player.y, progress),
+          vx: lerp(previous.vx, player.vx, progress),
+          vy: lerp(previous.vy, player.vy, progress),
+        }
+      }),
+    }
+  }
+
+  const aheadMs = Math.min(MAX_EXTRAPOLATION_MS, Math.max(0, renderAt - latest.receivedAt))
+  return {
+    ...latest.game,
+    elapsedMs: latest.game.elapsedMs + aheadMs,
+    players: latest.game.players.map((player) =>
+      projectPlayer(player, aheadMs, latest.game.world.width),
+    ),
+  }
+}
+
+function visualSolids(game: GameState) {
+  const solids = [...PLATFORMS]
+  if (game.team.bridgeActive) solids.push(BRIDGE)
+  if (!game.team.doorOneOpen) solids.push({ x: 2030, y: 430, w: 36, h: 190 })
+  if (!game.team.doorTwoOpen) solids.push({ x: 3420, y: 420, w: 38, h: 200 })
+  return solids
+}
+
+function movePredictedX(x: number, y: number, delta: number, game: GameState) {
+  let nextX = Math.max(0, Math.min(game.world.width - PLAYER_W, x + delta))
+  for (const solid of visualSolids(game)) {
+    const overlaps =
+      nextX < solid.x + solid.w &&
+      nextX + PLAYER_W > solid.x &&
+      y < solid.y + solid.h &&
+      y + PLAYER_H > solid.y
+    if (!overlaps) continue
+    if (delta > 0) nextX = solid.x - PLAYER_W
+    if (delta < 0) nextX = solid.x + solid.w
+  }
+  return nextX
+}
+
 type Props = {
   game: GameState
   localPlayerId: string
@@ -229,14 +328,29 @@ type Props = {
 
 export function GameCanvas({ game, localPlayerId, sendInput }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
-  const gameRef = useRef(game)
+  const snapshotsRef = useRef<TimedSnapshot[]>([{ game, receivedAt: performance.now() }])
+  const localVisualRef = useRef<LocalVisualState | null>(null)
+  const localJumpStartedAtRef = useRef<number | null>(null)
   const cameraRef = useRef(0)
   const inputRef = useRef<InputState>({ left: false, right: false, jump: false, action: false })
 
-  useEffect(() => { gameRef.current = game }, [game])
+  useEffect(() => {
+    const receivedAt = performance.now()
+    const snapshots = snapshotsRef.current
+    const latest = snapshots[snapshots.length - 1]
+    if (latest && game.tick === latest.game.tick && game.status === latest.game.status) return
+    if (latest && game.tick < latest.game.tick) {
+      snapshotsRef.current = [{ game, receivedAt }]
+      localVisualRef.current = null
+      return
+    }
+    snapshots.push({ game, receivedAt })
+    if (snapshots.length > 12) snapshots.splice(0, snapshots.length - 12)
+  }, [game])
 
   const updateControl = useCallback((control: keyof InputState, pressed: boolean) => {
     if (inputRef.current[control] === pressed) return
+    if (control === 'jump' && pressed) localJumpStartedAtRef.current = performance.now()
     inputRef.current = { ...inputRef.current, [control]: pressed }
     sendInput(inputRef.current)
   }, [sendInput])
@@ -277,8 +391,74 @@ export function GameCanvas({ game, localPlayerId, sendInput }: Props) {
     const context = canvas.getContext('2d')
     if (!context) return
     let frame = 0
-    const render = () => {
-      const state = gameRef.current
+    localVisualRef.current = null
+    const render = (now: number) => {
+      const snapshots = snapshotsRef.current
+      const latestSnapshot = snapshots[snapshots.length - 1]
+      const sampled = sampleBufferedGame(snapshots, now - INTERPOLATION_DELAY_MS)
+      if (!latestSnapshot || !sampled) {
+        frame = requestAnimationFrame(render)
+        return
+      }
+
+      const latestLocal = latestSnapshot.game.players.find((player) => player.id === localPlayerId)
+      let state = sampled
+      if (latestLocal) {
+        let visual = localVisualRef.current
+        if (!visual || visual.id !== latestLocal.id) {
+          visual = { id: latestLocal.id, x: latestLocal.x, y: latestLocal.y, lastFrameAt: now }
+          localVisualRef.current = visual
+        }
+
+        const frameMs = Math.max(0, Math.min(50, now - visual.lastFrameAt))
+        const frameTicks = frameMs / SERVER_TICK_MS
+        const direction = Number(inputRef.current.right) - Number(inputRef.current.left)
+        const inputVelocity = direction * LOCAL_MOVE_SPEED
+        visual.x = movePredictedX(visual.x, visual.y, inputVelocity * frameTicks, latestSnapshot.game)
+
+        const serverHasInput = Math.abs(latestLocal.vx - inputVelocity) < 0.25
+        if (serverHasInput || latestLocal.downed) {
+          const ageMs = Math.min(MAX_EXTRAPOLATION_MS, Math.max(0, now - latestSnapshot.receivedAt))
+          const targetX = movePredictedX(
+            latestLocal.x,
+            latestLocal.y,
+            latestLocal.vx * (ageMs / SERVER_TICK_MS),
+            latestSnapshot.game,
+          )
+          const error = targetX - visual.x
+          if (Math.abs(error) > 120) visual.x = targetX
+          else visual.x += error * (1 - Math.exp(-frameMs / LOCAL_CORRECTION_MS))
+        }
+
+        const latestAgeTicks = Math.min(
+          MAX_EXTRAPOLATION_MS,
+          Math.max(0, now - latestSnapshot.receivedAt),
+        ) / SERVER_TICK_MS
+        const jumpStartedAt = localJumpStartedAtRef.current
+        let targetY = latestLocal.grounded
+          ? latestLocal.y
+          : latestLocal.y + latestLocal.vy * latestAgeTicks + LOCAL_GRAVITY * latestAgeTicks * latestAgeTicks * 0.5
+        if (jumpStartedAt !== null && latestLocal.grounded && now - jumpStartedAt < 180) {
+          const jumpTicks = (now - jumpStartedAt) / SERVER_TICK_MS
+          targetY = latestLocal.y - LOCAL_JUMP_SPEED * jumpTicks + LOCAL_GRAVITY * jumpTicks * jumpTicks * 0.5
+        } else if (!latestLocal.grounded || now - (jumpStartedAt ?? now) >= 180) {
+          localJumpStartedAtRef.current = null
+        }
+        const yError = targetY - visual.y
+        if (Math.abs(yError) > 120) visual.y = targetY
+        else visual.y += yError * (1 - Math.exp(-frameMs / 45))
+        visual.lastFrameAt = now
+
+        state = {
+          ...sampled,
+          players: sampled.players.map((player) =>
+            player.id === localPlayerId
+              ? { ...latestLocal, x: visual.x, y: visual.y, facing: direction || latestLocal.facing }
+              : player,
+          ),
+        }
+      }
+
       const local = state.players.find((player) => player.id === localPlayerId)
       const partner = state.players.find((player) => player.id !== localPlayerId)
       const focusX = local && partner ? local.x * 0.68 + partner.x * 0.32 : local?.x ?? 0

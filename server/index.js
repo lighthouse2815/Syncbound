@@ -12,6 +12,7 @@ const io = new Server(httpServer, {
   cors: { origin: true, credentials: true },
 })
 const rooms = new Map()
+const STATE_BROADCAST_EVERY_TICKS = 2
 
 const cleanName = (value) => String(value || 'Người chơi').trim().slice(0, 18) || 'Người chơi'
 const cleanCode = (value) => String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 5)
@@ -39,8 +40,13 @@ function roomSnapshot(room) {
   }
 }
 
-function publishRoom(room) {
-  io.to(room.code).emit('room:state', roomSnapshot(room))
+function publishRoom(room, volatile = false) {
+  const channel = io.to(room.code)
+  if (volatile) {
+    channel.volatile.emit('room:state', roomSnapshot(room))
+    return
+  }
+  channel.emit('room:state', roomSnapshot(room))
 }
 
 function leaveCurrentRoom(socket) {
@@ -128,7 +134,8 @@ setInterval(() => {
   for (const room of rooms.values()) {
     if (!room.game || room.game.status !== 'playing') continue
     stepGame(room.game)
-    if (room.game.tick % 4 === 0) publishRoom(room)
+    if (room.game.status !== 'playing') publishRoom(room)
+    else if (room.game.tick % STATE_BROADCAST_EVERY_TICKS === 0) publishRoom(room, true)
   }
 }, 1000 / TICK_RATE)
 
